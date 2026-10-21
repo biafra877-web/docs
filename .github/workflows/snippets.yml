@@ -137,10 +137,20 @@ jobs:
       - name: Check extended snippets (Rust / Python / shell / JSON / TOML / YAML)
         run: pnpm run check:snippets-extended
 
+  # ---------------------------------------------------------------------------
+  # Stellar testnet snippet validation — split into two steps so that
+  # deterministic content regressions block merges while provider outages
+  # are surfaced as annotations without blocking.
+  #
+  # Exit codes from check-stellar-testnet-snippets.ts:
+  #   0  – passed
+  #   1  – content regression   → always a hard failure
+  #   2  – provider outage      → warning annotation, does NOT block merge
+  # ---------------------------------------------------------------------------
   stellar-testnet-snippets:
     name: Stellar snippet testnet validation
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # No top-level continue-on-error — individual steps control leniency.
     needs: extract-sdk-version
     steps:
       - name: Checkout
@@ -173,8 +183,32 @@ jobs:
         run: |
           echo "Testing against SDK version: ${{ needs.extract-sdk-version.outputs.sdk-version }}"
 
-      - name: Validate Stellar testnet snippets
+      # BLOCKING: deterministic content checks only (snippet count, file
+      # existence). A failure here means a real doc regression. Exit 1.
+      - name: Validate Stellar snippet content (blocking)
+        env:
+          MODE: content
         run: pnpm run check:stellar-testnet
+
+      # NON-BLOCKING: live provider availability checks. Failures here are
+      # provider outages (exit 2) and emit a ::warning:: annotation without
+      # failing the job. A genuine content-regression finding from a reachable
+      # provider still exits 1 and fails the job.
+      - name: Validate Stellar testnet provider availability (non-blocking)
+        id: provider-check
+        continue-on-error: true
+        env:
+          MODE: provider
+        run: pnpm run check:stellar-testnet
+
+      # Distinguish an outage (exit 2, warn only) from a real failure (exit 1,
+      # which continue-on-error already surfaced as a warning annotation in the
+      # previous step — re-fail the job here so the PR is blocked).
+      - name: Fail job on content regression from provider step
+        if: steps.provider-check.outcome == 'failure' && steps.provider-check.conclusion == 'failure'
+        run: |
+          echo "::error::Provider step exited with a content regression (exit 1). Failing the job."
+          exit 1
 
   playground-smoke:
     name: Playground smoke test
