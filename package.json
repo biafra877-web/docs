@@ -12,7 +12,7 @@
     "generate:python-quickstart-vectors": "tsx scripts/python-quickstart/generate-vectors.ts",
     "check:shell-commands": "node scripts/check-shell-commands.mjs",
     "test:shell-commands": "node --test scripts/check-shell-commands.test.mjs",
-    "check:contract-registry": "node --test scripts/check-contract-registry.test.mjs && node scripts/check-contract-registry.mjs",
+    "check:nav-coverage": "node scripts/check-nav-coverage.mjs",
     "check:compatibility-matrix": "node scripts/check-compatibility-matrix.mjs",
     "check:redirects-and-anchors": "node scripts/check-redirects-and-anchors.mjs",
     "test:redirects-and-anchors": "node --test scripts/check-redirects-and-anchors.test.mjs",
