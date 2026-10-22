@@ -137,10 +137,20 @@ jobs:
       - name: Check extended snippets (Rust / Python / shell / JSON / TOML / YAML)
         run: pnpm run check:snippets-extended
 
+  # ---------------------------------------------------------------------------
+  # Stellar testnet snippet validation — split into two steps so that
+  # deterministic content regressions block merges while provider outages
+  # are surfaced as annotations without blocking.
+  #
+  # Exit codes from check-stellar-testnet-snippets.ts:
+  #   0  – passed
+  #   1  – content regression   → always a hard failure
+  #   2  – provider outage      → warning annotation, does NOT block merge
+  # ---------------------------------------------------------------------------
   stellar-testnet-snippets:
     name: Stellar snippet testnet validation
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # No top-level continue-on-error — individual steps control leniency.
     needs: extract-sdk-version
     steps:
       - name: Checkout
@@ -173,8 +183,65 @@ jobs:
         run: |
           echo "Testing against SDK version: ${{ needs.extract-sdk-version.outputs.sdk-version }}"
 
-      - name: Validate Stellar testnet snippets
+      # BLOCKING: deterministic content checks only (snippet count, file
+      # existence). A failure here means a real doc regression. Exit 1.
+      - name: Validate Stellar snippet content (blocking)
+        env:
+          MODE: content
         run: pnpm run check:stellar-testnet
+
+      # NON-BLOCKING: live provider availability checks.
+      #
+      # continue-on-error keeps the job alive regardless of exit status, but it
+      # collapses outcome/conclusion so we cannot distinguish exit 1 from exit 2
+      # through those fields alone.  We therefore capture the raw exit status
+      # explicitly and write it to GITHUB_OUTPUT before the shell exits, giving
+      # the next step a reliable signal to branch on.
+      #
+      # Exit codes (defined in check-stellar-testnet-snippets.ts):
+      #   0  – all checks passed
+      #   1  – content regression   → hard failure, blocks merge
+      #   2  – provider outage      → warning annotation only, does NOT block
+      - name: Validate Stellar testnet provider availability (non-blocking)
+        id: provider-check
+        continue-on-error: true
+        env:
+          MODE: provider
+        run: |
+          set +e
+          pnpm run check:stellar-testnet
+          STATUS=$?
+          set -e
+          echo "exit-status=$STATUS" >> "$GITHUB_OUTPUT"
+          exit $STATUS
+
+      # Exit 1  → content regression from a reachable provider; hard-fail.
+      # Exit 2  → provider outage; emit a warning annotation and continue.
+      # Exit 0  → all good; nothing to do.
+      - name: Classify provider-check exit status
+        if: always()
+        env:
+          PROVIDER_EXIT: ${{ steps.provider-check.outputs.exit-status }}
+        run: |
+          case "$PROVIDER_EXIT" in
+            0)
+              echo "Provider check passed."
+              ;;
+            1)
+              echo "::error::Provider step detected a content regression (exit 1). Failing the job."
+              exit 1
+              ;;
+            2)
+              echo "::warning::Provider step reported a testnet outage (exit 2). Non-blocking."
+              ;;
+            *)
+              echo "::error::Provider step exited with unexpected status '$PROVIDER_EXIT'. Failing the job."
+              exit 1
+              ;;
+          esac
+
+      - name: Test exit-status classification logic
+        run: pnpm run test:stellar-testnet
 
   mint-validation:
     name: Mint config validation and preview redirect checks
