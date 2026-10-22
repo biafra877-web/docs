@@ -224,6 +224,7 @@ const PATH_LIKE_EXTENSIONS = new Set([
 export {
   validateFence,
   buildLogicalLines,
+  splitCommandSegments,
   tokenise,
   validateFlags,
   validateLocalPaths,
@@ -324,73 +325,103 @@ function validateFence(fence) {
     if (!noComment) continue;
 
     // Strip leading shell prompt ($ or >) used in docs examples.
-    const line = noComment.replace(/^[$>]\s+/, "");
-    if (!line) continue;
+    const promptStripped = noComment.replace(/^[$>]\s+/, "");
+    if (!promptStripped) continue;
 
     // Skip pure comment lines (# ...).
-    if (line.startsWith("#")) continue;
+    if (promptStripped.startsWith("#")) continue;
 
-    // ---------- Environment-variable assignment lines ----------
-    // Lines of the form VAR=value or VAR= (no command).
-    const envMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)/);
-    if (envMatch) {
-      const varName = envMatch[1];
-      const varValue = envMatch[2].trim();
+    // Split on compound operators (;, &&, ||, |) so every command segment
+    // is validated independently.  We must respect quoting so that operators
+    // inside strings (e.g. a JSON value) are not treated as separators.
+    const segments = splitCommandSegments(promptStripped);
 
-      // Only flag all-caps env var names as documented variables.
-      if (/^[A-Z][A-Z0-9_]*$/.test(varName)) {
-        if (!KNOWN_ENV_VARS.has(varName)) {
+    for (const segment of segments) {
+      const line = segment.trim();
+      if (!line) continue;
+      if (line.startsWith("#")) continue;
+
+      // Allow standalone operator tokens that splitCommandSegments may emit
+      // when the line starts with one (e.g. a leading pipe in a here-doc).
+      if (["|", "||", "&&", ";", "\\"].includes(line)) continue;
+
+      // ---------- Environment-variable prefix(es) ----------
+      // A segment may start with one or more VAR=value assignments before
+      // the actual command, e.g. "STELLAR_NETWORK=testnet soroban ...".
+      // We consume all leading assignments and then fall through to validate
+      // the remaining command (if any).
+      let remaining = line;
+      while (remaining) {
+        // Match VAR= followed by: a quoted string, a $(...) or `...`
+        // command substitution, or a run of non-space chars.
+        const envMatch = remaining.match(
+          /^([A-Za-z_][A-Za-z0-9_]*)=((?:"[^"]*"|'[^']*'|\$\([^)]*\)|`[^`]*`|\S)*)\s*/,
+        );
+        if (!envMatch) break;
+
+        const varName = envMatch[1];
+        // Only flag all-caps env var names as documented variables.
+        if (/^[A-Z][A-Z0-9_]*$/.test(varName)) {
+          if (!KNOWN_ENV_VARS.has(varName)) {
+            errors.push(
+              `${location}: undocumented environment variable '${varName}' — ` +
+              `add it to KNOWN_ENV_VARS in scripts/check-shell-commands.mjs if it is intentional`,
+            );
+          }
+        }
+        remaining = remaining.slice(envMatch[0].length).trim();
+      }
+
+      // After stripping env-var prefixes, if nothing is left this segment
+      // was a pure assignment — nothing further to validate.
+      if (!remaining) continue;
+
+      // If remaining starts with a subshell/command-substitution token the
+      // whole segment is a variable capture expression (e.g. VAR=$(cmd …)).
+      // The inner command is not a top-level executable to validate here.
+      if (remaining.startsWith("$(") || remaining.startsWith("`")) continue;
+
+      // ---------- Executable name ----------
+      const tokens = tokenise(remaining);
+      if (tokens.length === 0) continue;
+
+      const exe = tokens[0];
+
+      // Allow variable expansions like $SIGNED_XDR, $(…), `…` as first token.
+      if (exe.startsWith("$") || exe.startsWith("`")) continue;
+
+      // Allow line continuations or pipeline operators as first token.
+      if (["|", "||", "&&", ";", "\\"].includes(exe)) continue;
+
+      if (!KNOWN_TOOLS.has(exe)) {
+        errors.push(
+          `${location}: unknown executable '${exe}' — ` +
+          `add it to KNOWN_TOOLS in scripts/check-shell-commands.mjs if it is a real tool`,
+        );
+        continue; // No point validating flags of an unknown tool.
+      }
+
+      // ---------- Network / destructive command allowlist ----------
+      const isNetworkOrDestructive = isNetworkCommand(exe, tokens);
+      if (isNetworkOrDestructive) {
+        if (!NETWORK_ALLOWLIST.some((re) => re.test(remaining))) {
           errors.push(
-            `${location}: undocumented environment variable '${varName}' — ` +
-            `add it to KNOWN_ENV_VARS in scripts/check-shell-commands.mjs if it is intentional`,
+            `${location}: network/destructive command not in allowlist: '${remaining.slice(0, 80)}' — ` +
+            `add a pattern to NETWORK_ALLOWLIST in scripts/check-shell-commands.mjs`,
           );
         }
+        // Don't validate flags on allowlisted commands — their shapes vary widely.
+        continue;
       }
-      // If there's a command after the assignment it will be picked up on
-      // the next logical-line split — here we only validate the var name.
-      continue;
+
+      // ---------- Flag well-formedness ----------
+      const flagErrors = validateFlags(exe, tokens.slice(1), location, remaining);
+      errors.push(...flagErrors);
+
+      // ---------- Local path arguments ----------
+      const pathErrors = validateLocalPaths(tokens.slice(1), location);
+      errors.push(...pathErrors);
     }
-
-    // ---------- Executable name ----------
-    const tokens = tokenise(line);
-    if (tokens.length === 0) continue;
-
-    const exe = tokens[0];
-
-    // Allow variable expansions like $SIGNED_XDR, $(…), `…` as first token.
-    if (exe.startsWith("$") || exe.startsWith("`")) continue;
-
-    // Allow line continuations or pipeline operators as first token.
-    if (["|", "||", "&&", ";", "\\"].includes(exe)) continue;
-
-    if (!KNOWN_TOOLS.has(exe)) {
-      errors.push(
-        `${location}: unknown executable '${exe}' — ` +
-        `add it to KNOWN_TOOLS in scripts/check-shell-commands.mjs if it is a real tool`,
-      );
-      continue; // No point validating flags of an unknown tool.
-    }
-
-    // ---------- Network / destructive command allowlist ----------
-    const isNetworkOrDestructive = isNetworkCommand(exe, tokens);
-    if (isNetworkOrDestructive) {
-      if (!NETWORK_ALLOWLIST.some((re) => re.test(line))) {
-        errors.push(
-          `${location}: network/destructive command not in allowlist: '${line.slice(0, 80)}' — ` +
-          `add a pattern to NETWORK_ALLOWLIST in scripts/check-shell-commands.mjs`,
-        );
-      }
-      // Don't validate flags on allowlisted commands — their shapes vary widely.
-      continue;
-    }
-
-    // ---------- Flag well-formedness ----------
-    const flagErrors = validateFlags(exe, tokens.slice(1), location, line);
-    errors.push(...flagErrors);
-
-    // ---------- Local path arguments ----------
-    const pathErrors = validateLocalPaths(tokens.slice(1), location);
-    errors.push(...pathErrors);
   }
 
   return errors;
@@ -436,6 +467,67 @@ function buildLogicalLines(code) {
   }
   if (current) logical.push(current);
   return logical;
+}
+
+// ---------------------------------------------------------------------------
+// Compound operator splitting (;, &&, ||, |)
+// ---------------------------------------------------------------------------
+
+/**
+ * Splits a single logical line into individual command segments by splitting
+ * on unquoted `;`, `&&`, `||`, and `|` operators.  Quoted regions are
+ * respected so that operators inside strings are not treated as separators.
+ * The quote characters themselves are preserved in the output segments.
+ *
+ * @param {string} line
+ * @returns {string[]}  non-empty segment strings, operators themselves excluded
+ */
+function splitCommandSegments(line) {
+  const segments = [];
+  let current  = "";
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (inSingle) {
+      current += ch;
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      current += ch;
+      if (ch === '"' && (i === 0 || line[i - 1] !== "\\")) inDouble = false;
+      continue;
+    }
+
+    if (ch === "'") { inSingle = true; current += ch; continue; }
+    if (ch === '"') { inDouble = true; current += ch; continue; }
+
+    // Two-character operators: &&, ||
+    if ((ch === "&" || ch === "|") && line[i + 1] === ch) {
+      const seg = current.trim();
+      if (seg) segments.push(seg);
+      current = "";
+      i++; // skip the second character
+      continue;
+    }
+
+    // Single-character operators: ; or |
+    if (ch === ";" || ch === "|") {
+      const seg = current.trim();
+      if (seg) segments.push(seg);
+      current = "";
+      continue;
+    }
+
+    current += ch;
+  }
+
+  const last = current.trim();
+  if (last) segments.push(last);
+  return segments;
 }
 
 // ---------------------------------------------------------------------------

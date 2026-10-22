@@ -13,6 +13,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildLogicalLines,
+  splitCommandSegments,
   tokenise,
   validateFence,
   validateFlags,
@@ -507,4 +508,161 @@ test("NETWORK_ALLOWLIST allows npm run", () => {
   assert.ok(
     NETWORK_ALLOWLIST.some((re) => re.test("npm run check:compatibility-matrix")),
   );
+});
+
+// ---------------------------------------------------------------------------
+// splitCommandSegments — unit tests
+// ---------------------------------------------------------------------------
+
+test("splitCommandSegments: single command returns one segment", () => {
+  assert.deepEqual(splitCommandSegments("echo ok"), ["echo ok"]);
+});
+
+test("splitCommandSegments: splits on semicolon", () => {
+  assert.deepEqual(
+    splitCommandSegments("echo ok; echo two"),
+    ["echo ok", "echo two"],
+  );
+});
+
+test("splitCommandSegments: splits on &&", () => {
+  assert.deepEqual(
+    splitCommandSegments("npm install foo && echo done"),
+    ["npm install foo", "echo done"],
+  );
+});
+
+test("splitCommandSegments: splits on ||", () => {
+  assert.deepEqual(
+    splitCommandSegments("npm install foo || echo failed"),
+    ["npm install foo", "echo failed"],
+  );
+});
+
+test("splitCommandSegments: splits on pipe |", () => {
+  assert.deepEqual(
+    splitCommandSegments("echo foo | grep foo"),
+    ["echo foo", "grep foo"],
+  );
+});
+
+test("splitCommandSegments: semicolon inside single quotes is NOT a separator", () => {
+  assert.deepEqual(
+    splitCommandSegments("echo 'a; b'"),
+    ["echo 'a; b'"],
+  );
+});
+
+test("splitCommandSegments: pipe inside double quotes is NOT a separator", () => {
+  assert.deepEqual(
+    splitCommandSegments('echo "a | b"'),
+    ['echo "a | b"'],
+  );
+});
+
+test("splitCommandSegments: multiple operators produce multiple segments", () => {
+  const result = splitCommandSegments("echo a; echo b && echo c");
+  assert.equal(result.length, 3);
+  assert.equal(result[0], "echo a");
+  assert.equal(result[1], "echo b");
+  assert.equal(result[2], "echo c");
+});
+
+// ---------------------------------------------------------------------------
+// validateFence — semicolon regression tests
+// ---------------------------------------------------------------------------
+
+test("validateFence: rejects unknown tool after semicolon", () => {
+  const errors = validateFence(fence("echo ok; totally-unknown-tool arg\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: rejects unknown tool after && operator", () => {
+  const errors = validateFence(fence("npm install foo && totally-unknown-tool arg\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: rejects unknown tool piped after allowlisted curl", () => {
+  const errors = validateFence(
+    fence("curl https://api.usewraith.xyz/agent/info/x | totally-unknown-tool\n"),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: accepts known tools on both sides of a pipe", () => {
+  const errors = validateFence(fence("echo hello | grep hello\n"));
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: accepts known tools on both sides of &&", () => {
+  const errors = validateFence(fence("mkdir -p /tmp/foo && cd /tmp/foo\n"));
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: accepts known tools on both sides of semicolon", () => {
+  const errors = validateFence(fence("echo a; echo b\n"));
+  assert.equal(errors.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// validateFence — env-var prefix (assignment-prefixed command) regression tests
+// ---------------------------------------------------------------------------
+
+test("validateFence: rejects unknown tool after env var assignment prefix", () => {
+  const errors = validateFence(fence("STELLAR_NETWORK=testnet totally-unknown-tool arg\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: validates known tool after documented env var prefix", () => {
+  // soroban is a wildcard tool (no flag errors expected), STELLAR_NETWORK is documented
+  const errors = validateFence(
+    fence("STELLAR_NETWORK=testnet soroban contract build\n"),
+  );
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: rejects undocumented env var even when followed by known tool", () => {
+  const errors = validateFence(fence("UNDOC_VAR=foo echo hello\n"));
+  // UNDOC_VAR should be flagged as undocumented; echo is known so no exe error
+  assert.ok(errors.some((e) => /undocumented environment variable/.test(e) && /UNDOC_VAR/.test(e)));
+  assert.equal(errors.filter((e) => /unknown executable/.test(e)).length, 0);
+});
+
+test("validateFence: rejects undocumented env var and unknown tool in same prefix-command", () => {
+  const errors = validateFence(fence("UNDOC_VAR=foo totally-unknown-tool arg\n"));
+  assert.ok(errors.some((e) => /undocumented environment variable/.test(e)));
+  assert.ok(errors.some((e) => /unknown executable/.test(e) && /totally-unknown-tool/.test(e)));
+});
+
+test("validateFence: pure env-var assignment (no command) still passes for documented vars", () => {
+  const errors = validateFence(fence("STELLAR_NETWORK=testnet\n"));
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: pure env-var assignment (no command) still rejects undocumented vars", () => {
+  const errors = validateFence(fence("UNDOCUMENTED_VAR=some_value\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /undocumented environment variable/);
+});
+
+// ---------------------------------------------------------------------------
+// validateFence — compound operator + env prefix combined
+// ---------------------------------------------------------------------------
+
+test("validateFence: semicolon with env-var prefix on second segment is validated", () => {
+  // First segment is clean; second has an unknown tool after an env prefix.
+  const errors = validateFence(
+    fence("echo start; STELLAR_NETWORK=testnet totally-unknown-tool\n"),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
 });
