@@ -19,7 +19,7 @@
     "test:preview-redirect": "node --test scripts/check-preview-redirect.test.mjs",
     "check:stellar-testnet": "tsx scripts/check-stellar-testnet-snippets.ts",
     "generate:stellar-reference": "tsx scripts/generate-stellar-reference.ts",
-    "check:stellar-reference": "tsx scripts/generate-stellar-reference.ts --check --allow-missing",
+    "check:stellar-reference": "tsx scripts/generate-stellar-reference.ts --check",
     "generate:playground-fixtures": "node scripts/playground/generate-fixtures.mjs",
     "check:playground-fixtures": "node scripts/playground/generate-fixtures.mjs --check",
     "test:playground": "playwright test --config scripts/playground/tests/playwright.config.ts",
