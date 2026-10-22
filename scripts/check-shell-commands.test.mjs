@@ -18,6 +18,8 @@ import {
   validateFence,
   validateFlags,
   looksLikeLocalPath,
+  extractCommandSubstitutions,
+  validateCommandSubstitutions,
   KNOWN_TOOLS,
   KNOWN_ENV_VARS,
   NETWORK_ALLOWLIST,
@@ -665,4 +667,170 @@ test("validateFence: semicolon with env-var prefix on second segment is validate
   assert.equal(errors.length, 1);
   assert.match(errors[0], /unknown executable/);
   assert.match(errors[0], /totally-unknown-tool/);
+});
+
+// ---------------------------------------------------------------------------
+// extractCommandSubstitutions — unit tests
+// ---------------------------------------------------------------------------
+
+test("extractCommandSubstitutions: returns empty array for plain text", () => {
+  assert.deepEqual(extractCommandSubstitutions("echo hello"), []);
+});
+
+test("extractCommandSubstitutions: extracts single $(...) body", () => {
+  const bodies = extractCommandSubstitutions("$(totally-unknown-tool --steal)");
+  assert.ok(bodies.includes("totally-unknown-tool --steal"));
+});
+
+test("extractCommandSubstitutions: extracts single backtick body", () => {
+  const bodies = extractCommandSubstitutions("`totally-unknown-tool --steal`");
+  assert.ok(bodies.includes("totally-unknown-tool --steal"));
+});
+
+test("extractCommandSubstitutions: extracts $(...) embedded in a larger string", () => {
+  const bodies = extractCommandSubstitutions("echo $(date) world");
+  assert.ok(bodies.includes("date"));
+});
+
+test("extractCommandSubstitutions: extracts multiple substitutions", () => {
+  const bodies = extractCommandSubstitutions("$(foo) bar $(baz)");
+  assert.ok(bodies.includes("foo"));
+  assert.ok(bodies.includes("baz"));
+});
+
+test("extractCommandSubstitutions: handles nested $(...) — outer and inner both returned", () => {
+  const bodies = extractCommandSubstitutions("$(echo $(date))");
+  // outer body is "echo $(date)", inner body is "date"
+  assert.ok(bodies.some((b) => b.includes("echo")));
+  assert.ok(bodies.some((b) => b.trim() === "date"));
+});
+
+test("extractCommandSubstitutions: handles backtick with escape", () => {
+  const bodies = extractCommandSubstitutions("`echo \\`inner\\``");
+  // outer backtick body should be non-empty
+  assert.ok(bodies.length >= 1);
+});
+
+// ---------------------------------------------------------------------------
+// validateCommandSubstitutions — unit tests
+// ---------------------------------------------------------------------------
+
+test("validateCommandSubstitutions: no error for known tool inside $()", () => {
+  const errors = [];
+  validateCommandSubstitutions("$(node sign.js)", "file.mdx:1", errors);
+  assert.equal(errors.length, 0);
+});
+
+test("validateCommandSubstitutions: reports error for unknown tool inside $()", () => {
+  const errors = [];
+  validateCommandSubstitutions("$(totally-unknown-tool --steal)", "file.mdx:1", errors);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+  assert.match(errors[0], /command substitution/);
+});
+
+test("validateCommandSubstitutions: reports error for unknown tool inside backticks", () => {
+  const errors = [];
+  validateCommandSubstitutions("`totally-unknown-tool --steal`", "file.mdx:1", errors);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateCommandSubstitutions: no error when no substitution present", () => {
+  const errors = [];
+  validateCommandSubstitutions("just plain text", "file.mdx:1", errors);
+  assert.equal(errors.length, 0);
+});
+
+test("validateCommandSubstitutions: catches unknown tool in nested substitution", () => {
+  const errors = [];
+  validateCommandSubstitutions("$(echo $(totally-unknown-tool))", "file.mdx:1", errors);
+  assert.ok(errors.some((e) => /totally-unknown-tool/.test(e)));
+});
+
+// ---------------------------------------------------------------------------
+// validateFence — command substitution regression tests (assignment position)
+// ---------------------------------------------------------------------------
+
+test("validateFence: rejects unknown tool in $() assignment value — regression", () => {
+  // This was previously silently accepted; the inner command must be validated.
+  const errors = validateFence(fence("SIGNED_XDR=$(totally-unknown-tool --steal)\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: rejects unknown tool in backtick assignment value — regression", () => {
+  const errors = validateFence(fence("SIGNED_XDR=`totally-unknown-tool --steal`\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: accepts known tool in $() assignment value", () => {
+  // node is in KNOWN_TOOLS; this must continue to pass after the fix.
+  const errors = validateFence(fence("SIGNED_XDR=$(node sign.js foo)\n"));
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: accepts known tool in backtick assignment value", () => {
+  const errors = validateFence(fence("SIGNED_XDR=`node sign.js foo`\n"));
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: rejects unknown tool in $() inside undocumented var assignment", () => {
+  // Both the undocumented var and the unknown inner tool must be reported.
+  const errors = validateFence(fence("UNDOC_VAR=$(totally-unknown-tool --steal)\n"));
+  assert.ok(errors.some((e) => /undocumented environment variable/.test(e)));
+  assert.ok(errors.some((e) => /unknown executable/.test(e) && /totally-unknown-tool/.test(e)));
+});
+
+// ---------------------------------------------------------------------------
+// validateFence — command substitution regression tests (argument position)
+// ---------------------------------------------------------------------------
+
+test("validateFence: rejects unknown tool in $() argument position — regression", () => {
+  // echo $(totally-unknown-tool --steal) was previously silently accepted.
+  const errors = validateFence(fence("echo $(totally-unknown-tool --steal)\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: rejects unknown tool in backtick argument position — regression", () => {
+  const errors = validateFence(fence("echo `totally-unknown-tool --steal`\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: accepts known tool in $() argument position", () => {
+  // stellar keys address is allowlisted, and the outer echo is known.
+  const errors = validateFence(
+    fence("echo $(stellar keys address my-key)\n"),
+  );
+  assert.equal(errors.length, 0);
+});
+
+test("validateFence: rejects unknown tool in nested command substitution", () => {
+  const errors = validateFence(fence("echo $(echo $(totally-unknown-tool))\n"));
+  assert.ok(errors.some((e) => /totally-unknown-tool/.test(e)));
+});
+
+test("validateFence: rejects unknown tool in $() after compound operator", () => {
+  // The substitution is in the second segment of a semicolon-separated line.
+  const errors = validateFence(
+    fence("npm install foo; echo $(totally-unknown-tool --steal)\n"),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /unknown executable/);
+  assert.match(errors[0], /totally-unknown-tool/);
+});
+
+test("validateFence: multiple clean known-tool substitutions pass", () => {
+  // Both node and echo are in KNOWN_TOOLS; neither substitution should error.
+  const errors = validateFence(fence("echo $(node --version) $(echo ok)\n"));
+  assert.equal(errors.length, 0);
 });

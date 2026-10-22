@@ -229,6 +229,8 @@ export {
   validateFlags,
   validateLocalPaths,
   looksLikeLocalPath,
+  extractCommandSubstitutions,
+  validateCommandSubstitutions,
   KNOWN_TOOLS,
   KNOWN_ENV_VARS,
   NETWORK_ALLOWLIST,
@@ -369,6 +371,12 @@ function validateFence(fence) {
             );
           }
         }
+
+        // ---------- Command substitutions inside the assignment value ----------
+        // e.g. SIGNED_XDR=$(totally-unknown-tool --steal) must be caught here.
+        const assignValue = envMatch[2] ?? "";
+        validateCommandSubstitutions(assignValue, location, errors);
+
         remaining = remaining.slice(envMatch[0].length).trim();
       }
 
@@ -378,8 +386,12 @@ function validateFence(fence) {
 
       // If remaining starts with a subshell/command-substitution token the
       // whole segment is a variable capture expression (e.g. VAR=$(cmd …)).
-      // The inner command is not a top-level executable to validate here.
-      if (remaining.startsWith("$(") || remaining.startsWith("`")) continue;
+      // The inner command is not a top-level executable to validate here —
+      // but we DO validate the executable inside the substitution itself.
+      if (remaining.startsWith("$(") || remaining.startsWith("`")) {
+        validateCommandSubstitutions(remaining, location, errors);
+        continue;
+      }
 
       // ---------- Executable name ----------
       const tokens = tokenise(remaining);
@@ -400,6 +412,11 @@ function validateFence(fence) {
         );
         continue; // No point validating flags of an unknown tool.
       }
+
+      // ---------- Command substitutions in argument positions ----------
+      // e.g. echo $(totally-unknown-tool --steal) must be caught here.
+      // We scan the full `remaining` string (which includes all arguments).
+      validateCommandSubstitutions(remaining, location, errors);
 
       // ---------- Network / destructive command allowlist ----------
       const isNetworkOrDestructive = isNetworkCommand(exe, tokens);
@@ -566,6 +583,104 @@ function tokenise(line) {
   }
   if (current) tokens.push(current);
   return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// Command-substitution extraction and recursive validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the body text of every `$(...)` and `\`...\`` command substitution
+ * present in `text`.  Nested `$(...)` are handled by tracking parenthesis
+ * depth so that `$(echo $(date))` yields both `echo $(date)` and `date`.
+ *
+ * @param {string} text  — any shell fragment (assignment value, argument, …)
+ * @returns {string[]}   — array of substitution body strings (inner text only)
+ */
+function extractCommandSubstitutions(text) {
+  const bodies = [];
+  let i = 0;
+
+  while (i < text.length) {
+    // $( ... ) — track depth for nesting
+    if (text[i] === "$" && text[i + 1] === "(") {
+      i += 2; // skip "$("
+      let depth = 1;
+      let body = "";
+      while (i < text.length && depth > 0) {
+        const ch = text[i];
+        if (ch === "(") depth++;
+        else if (ch === ")") {
+          depth--;
+          if (depth === 0) { i++; break; }
+        }
+        body += ch;
+        i++;
+      }
+      if (body) bodies.push(body);
+      // Recurse into the body so nested substitutions are also captured.
+      bodies.push(...extractCommandSubstitutions(body));
+      continue;
+    }
+
+    // `...` — backtick form (no nesting allowed by POSIX, so just scan to
+    // the next unescaped backtick)
+    if (text[i] === "`") {
+      i++; // skip opening backtick
+      let body = "";
+      while (i < text.length && text[i] !== "`") {
+        if (text[i] === "\\" && i + 1 < text.length) {
+          // Consume escape sequence but include only the escaped char.
+          body += text[i + 1];
+          i += 2;
+        } else {
+          body += text[i];
+          i++;
+        }
+      }
+      i++; // skip closing backtick
+      if (body) bodies.push(body);
+      bodies.push(...extractCommandSubstitutions(body));
+      continue;
+    }
+
+    i++;
+  }
+
+  return bodies;
+}
+
+/**
+ * Validates the executable name inside every command substitution found in
+ * `text`.  Pushes error strings into `errors` for any unknown executable.
+ *
+ * @param {string}   text      — shell fragment to scan (may contain $(...)/`...`)
+ * @param {string}   location  — "file:line" for error messages
+ * @param {string[]} errors    — mutable array to append errors into
+ */
+function validateCommandSubstitutions(text, location, errors) {
+  const bodies = extractCommandSubstitutions(text);
+  for (const body of bodies) {
+    const bodyTrimmed = body.trim();
+    if (!bodyTrimmed) continue;
+
+    // Tokenise the body the same way the main validator does.
+    const tokens = tokenise(bodyTrimmed);
+    if (tokens.length === 0) continue;
+
+    const exe = tokens[0];
+
+    // Skip variable expansions or operator tokens as the "executable".
+    if (exe.startsWith("$") || exe.startsWith("`")) continue;
+    if (["|", "||", "&&", ";", "\\"].includes(exe)) continue;
+
+    if (!KNOWN_TOOLS.has(exe)) {
+      errors.push(
+        `${location}: unknown executable '${exe}' inside command substitution — ` +
+        `add it to KNOWN_TOOLS in scripts/check-shell-commands.mjs if it is a real tool`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
